@@ -14,44 +14,57 @@ This document describes the architecture for an AI-powered customer support agen
 
 ## 2. High-Level Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      INCOMING CHANNELS                       │
-│   WhatsApp Business API     Instagram DMs / Comments API     │
-└──────────────────────┬──────────────────┬───────────────────┘
-                       │                  │
-                       ▼                  ▼
-┌─────────────────────────────────────────────────────────────┐
-│              MESSAGE GATEWAY & SESSION MANAGER               │
-│  Webhook handler · merchant routing · 24h window tracking    │
-└─────────────────────────────┬───────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     CONTEXT ASSEMBLY                         │
-│  Working window (last 5–7 raw) · Rolling summary · Log       │
-└─────────────────────────────┬───────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│             AGENT ORCHESTRATOR — Gemini 2.5 Flash            │
-│  Intent · language · sentiment · guardrails · tool dispatch  │
-└──────────┬─────────────────┬──────────────────┬────────────┘
-           │                 │                  │
-           ▼                 ▼                  ▼
-    Order tools        Product tools     Escalation trigger
-           │                 │                  │
-           ▼                 ▼                  ▼
-┌──────────────────┐ ┌───────────────┐ ┌──────────────────────┐
-│ Commerce adapter │ │ Product index  │ │ Manager alert system │
-│ Shopify / Woo    │ │ (from commerce)│ │ Email + WhatsApp     │
-└──────────────────┘ └───────────────┘ └──────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────┐
-│   Courier adapter (status only)  │
-│   Bosta · Aramex                 │
-└──────────────────────────────────┘
+```mermaid
+flowchart TD
+    WA["📱 WhatsApp Business API"]
+    IG["📷 Instagram DMs / Comments API"]
+
+    GW["🔀 Message Gateway & Session Manager\nWebhook handler · merchant routing · 24h window tracking"]
+
+    MP["🎵 Media Processor\nVoice · Image · Document handling"]
+
+    CA["📦 Context Assembly\nWorking window · Rolling summary · Long-term log"]
+
+    ORC["🤖 Agent Orchestrator — Gemini 2.5 Flash\nIntent · language · sentiment · guardrails · tool dispatch"]
+
+    OT["🛒 Order Tools"]
+    PT["🔍 Product Tools"]
+    ET["🚨 Escalation Trigger"]
+
+    COM["🏪 Commerce Adapter\nShopify / WooCommerce"]
+    IDX["📚 Product Index\n(from commerce)"]
+    MAS["📣 Manager Alert System\nEmail + WhatsApp"]
+
+    COR["🚚 Courier Adapter — status only\nBosta · Aramex"]
+
+    WA & IG --> GW
+    GW --> MP
+    MP --> CA
+    CA --> ORC
+
+    ORC --> OT
+    ORC --> PT
+    ORC --> ET
+
+    OT --> COM
+    PT --> IDX
+    ET --> MAS
+
+    COM --> COR
+
+    style WA        fill:#25D366,color:#fff,stroke:none
+    style IG        fill:#E1306C,color:#fff,stroke:none
+    style GW        fill:#3B82F6,color:#fff,stroke:none
+    style MP        fill:#8B5CF6,color:#fff,stroke:none
+    style CA        fill:#0EA5E9,color:#fff,stroke:none
+    style ORC       fill:#F59E0B,color:#fff,stroke:none
+    style OT        fill:#6366F1,color:#fff,stroke:none
+    style PT        fill:#6366F1,color:#fff,stroke:none
+    style ET        fill:#EF4444,color:#fff,stroke:none
+    style COM       fill:#10B981,color:#fff,stroke:none
+    style IDX       fill:#10B981,color:#fff,stroke:none
+    style MAS       fill:#EF4444,color:#fff,stroke:none
+    style COR       fill:#64748B,color:#fff,stroke:none
 ```
 
 ---
@@ -71,6 +84,10 @@ Connects via Meta's Graph API, handling both direct messages and comment replies
 ### 3.3 Channel selection per merchant
 
 During onboarding, the merchant configures which channels they want active. The gateway routes all incoming traffic to a unified internal message format before it reaches the orchestrator.
+
+### 3.4 Media support by channel
+
+WhatsApp supports voice notes, images, and documents natively in its webhook payload. Instagram supports images and voice messages in DMs via the Messenger Platform API (same Graph API surface) — but voice message support in the API is limited and worth testing per region. In practice WhatsApp is the more reliable channel for media-heavy conversations in MENA.
 
 ---
 
@@ -93,6 +110,25 @@ On session close, the gateway triggers the memory write-back process (see Sectio
 ### 4.3 Merchant routing
 
 Each incoming webhook carries enough metadata (phone number, Instagram account ID) to identify the merchant. The gateway looks up the tenant ID in the config store and attaches it to all downstream calls, ensuring strict data isolation.
+
+### 4.4 Media Processor
+
+The Media Processor is a discrete step that runs after webhook receipt and before context assembly, only when the incoming message contains a non-text payload.
+
+**Processing pipeline by media type:**
+
+| Media type | Step 1 | Step 2 | Step 3 |
+|---|---|---|---|
+| Voice note | Download audio from Meta CDN | Pass raw audio to Gemini as multimodal input (or optionally to Whisper to produce a text transcript first) | Attach transcript (or audio reference) to message context |
+| Image | Download from Meta CDN | Pass image to Gemini as multimodal input | Attach image reference to message context |
+| Document / sticker / video | — | — | Gateway replies: "I can only handle text, voice, and images" |
+
+**Decisions:**
+
+- Gemini 2.5 Flash is the default path for both audio and image — it accepts raw multimodal input without a separate transcription step, keeping latency low.
+- Whisper is an optional fallback for audio if a verbatim text transcript is required for the audit trail (configurable per merchant).
+- The downloaded media file is stored and its CDN URL recorded in `MEDIA_ASSET.storage_url` before any model call, so the asset is always recoverable even if processing fails.
+- Unsupported types (document, sticker, video) are short-circuited before any model call to avoid unnecessary spend.
 
 ---
 
@@ -156,6 +192,8 @@ The orchestrator's system prompt is assembled dynamically per turn and contains:
 4. **Working window** — last 5–7 verbatim exchanges.
 5. **Tool manifest** — available tools based on the merchant's integration map (e.g. if merchant has no courier configured, tracking tools are omitted).
 6. **Core instructions** — language handling, confirmation rules, escalation rules, response length guidelines.
+   - *Voice:* "When a transcription is provided, treat it exactly like a text message. If the audio was unclear, ask the customer to retype."
+   - *Image:* "If a customer sends an image, determine if it's an order screenshot, a product photo, a damage claim, or irrelevant. Act accordingly."
 
 ### 6.3 Language handling
 
@@ -666,6 +704,9 @@ erDiagram
     string intent_classified
     float sentiment_score
     string platform_message_id
+    string message_type
+    string media_url
+    text media_transcription
     timestamp created_at
   }
 
@@ -727,17 +768,31 @@ erDiagram
     timestamp created_at
   }
 
+  MEDIA_ASSET {
+    uuid id PK
+    uuid message_id FK
+    uuid tenant_id FK
+    string platform_media_id
+    string media_type
+    string mime_type
+    string storage_url
+    string transcription
+    string processing_status
+    timestamp created_at
+  }
+
   SESSION ||--o{ MESSAGE : "contains"
   SESSION ||--o| ESCALATION : "may trigger"
   SESSION ||--o{ CONFIRMATION_GATE : "may open"
   SESSION ||--o{ AUDIT_LOG : "produces"
   SESSION_LOG }o--|| SESSION : "summarises"
   CUSTOMER_MEMORY ||--|| SESSION : "loaded into"
+  MESSAGE ||--o{ MEDIA_ASSET : "has"
 ```
 
 The first diagram covers the tenant/merchant spine — everything that gets configured once during onboarding. Now the operational side: conversations, memory, sessions, and escalations.Here's a walkthrough of every design decision:
 
-**12 tables across two domains.** The split is clean: the first 5 tables are configured once per merchant (tenant, config, integrations, channels, customers) and are essentially slow-moving reference data. The second 7 are operational — they grow with every conversation.
+**13 tables across two domains.** The split is clean: the first 5 tables are configured once per merchant (tenant, config, integrations, channels, customers) and are essentially slow-moving reference data. The second 8 are operational — they grow with every conversation.
 
 **Tenant-first design.** Every table that holds live data carries a `tenant_id` directly — not just through a join. This allows row-level partitioning (or even separate schemas per tenant at scale) without restructuring. You never accidentally query across tenant boundaries.
 
