@@ -546,7 +546,7 @@ Steps 1–9 as above, but:
 |Rule-based + AI sentiment escalation|✅|
 |Multi-tenant isolation|✅|
 |Manual merchant onboarding|✅|
-|Merchant dashboard|❌ Post-MVP|
+|Merchant dashboard|✅|
 |Self-serve onboarding flow|❌ Post-MVP|
 |Full conversation transcript storage|❌ Optional / Post-MVP|
 |Payment processing|❌ Post-MVP|
